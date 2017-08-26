@@ -10,13 +10,10 @@ import glob
 import datetime
 from ._compat import unittest
 
-from pydal._compat import PY2, basestring, StringIO, integer_types
-
-long = integer_types[-1]
-
+from pydal._compat import PY2, basestring, StringIO, to_bytes, long
 from pydal import DAL, Field
 from pydal.objects import Table, Query, Expression
-from pydal.helpers.classes import SQLALL
+from pydal.helpers.classes import SQLALL, OpRow
 from pydal.exceptions import NotOnNOSQLError
 from ._adapt import DEFAULT_URI, IS_IMAP, drop, IS_GAE, IS_MONGODB, _quote
 
@@ -184,13 +181,18 @@ class TestMongo(unittest.TestCase):
             db.define_table('tt', Field('aa'))
             self.assertEqual(isinstance(db.tt.insert(aa='x'), long), True)
             with self.assertRaises(RuntimeError):
-                db._adapter.delete('tt', 'x', safe=safe)
+                db._adapter.delete(db['tt'], 'x', safe=safe)
             self.assertEqual(db._adapter.delete(
-                'tt', Query(db, db._adapter.dialect.eq, db.tt.aa, 'x'), safe=safe), 1)
+                db['tt'], Query(db, db._adapter.dialect.eq, db.tt.aa, 'x'), safe=safe), 1)
             self.assertEqual(db(db.tt.aa=='x').count(), 0)
-            self.assertEqual(db._adapter.update('tt',
+            self.assertEqual(
+                db._adapter.update(
+                    db['tt'],
                     Query(db, db._adapter.dialect.eq, db.tt.aa, 'x'),
-                    db['tt']._listify({'aa':'x'}), safe=safe), 0)
+                    db['tt']._fields_and_values_for_update(
+                        {'aa':'x'}).op_values(),
+                    safe=safe
+                ), 0)
             drop(db.tt)
             db.close()
 
@@ -340,14 +342,17 @@ class TestFields(unittest.TestCase):
             self.assertTrue(isinstance(db.tt.insert(), long))
             self.assertTrue(isinstance(db.tt.insert(aa=iv[1]), long))
             self.assertTrue(isinstance(db.tt.insert(aa=None), long))
+            cv = iv[1]
+            if IS_MONGODB and not PY2 and iv[0] == 'blob':
+                cv = to_bytes(iv[1])
             self.assertEqual(db().select(db.tt.aa)[0].aa, default_return)
-            self.assertEqual(db().select(db.tt.aa)[1].aa, iv[1])
+            self.assertEqual(db().select(db.tt.aa)[1].aa, cv)
             self.assertEqual(db().select(db.tt.aa)[2].aa, None)
 
             if not IS_GAE:
                 ## field aliases
                 row = db().select(db.tt.aa.with_alias('zz'))[1]
-                self.assertEqual(row['zz'], iv[1])
+                self.assertEqual(row['zz'], cv)
 
             drop(db.tt)
 
@@ -612,6 +617,8 @@ class TestSelect(unittest.TestCase):
                 db(db.tt).select(db.tt.t0_id).last()[db.tt.t0_id], ref3)
 
             if IS_MONGODB:
+                self.assertEqual(db(db.tt.t0_id == ref3).count(), 1)
+
                 self.assertEqual(db(db.tt.t0_id.contains(id_a1)).count(), 2)
                 self.assertEqual(db(db.tt.t0_id.contains(id_a2)).count(), 2)
                 db(db.t0.aa == 'test1').delete()
@@ -1844,8 +1851,11 @@ class TestRNameFields(unittest.TestCase):
         rname = _quote(db, 'a very complicated fieldname')
         for ft in ['string', 'text', 'password', 'upload', 'blob']:
             db.define_table('tt', Field('aa', ft, default='', rname=rname))
+            cv = 'x'
             self.assertEqual(isinstance(db.tt.insert(aa='x'), long), True)
-            self.assertEqual(db().select(db.tt.aa)[0].aa, 'x')
+            if IS_MONGODB and not PY2 and ft == 'blob':
+                cv = to_bytes(cv)
+            self.assertEqual(db().select(db.tt.aa)[0].aa, cv)
             drop(db.tt)
         db.define_table('tt', Field('aa', 'integer', default=1, rname=rname))
         self.assertEqual(isinstance(db.tt.insert(aa=3), long), True)
@@ -2284,7 +2294,7 @@ class TestBulkInsert(unittest.TestCase):
         global ctr
         ctr = 0
         def test_after_insert(i, r):
-            self.assertIsInstance(i, dict)
+            self.assertIsInstance(i, OpRow)
             global ctr
             ctr += 1
             return True

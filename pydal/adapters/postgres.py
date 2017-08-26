@@ -1,14 +1,15 @@
 import re
-from .._compat import PY2, with_metaclass, iterkeys, to_unicode
+from .._compat import PY2, with_metaclass, iterkeys, to_unicode, long
 from .._globals import IDENTITY, THREAD_LOCAL
 from ..drivers import psycopg2_adapt
+from ..helpers.classes import ConnectionConfigurationMixin
 from .base import SQLAdapter
 from . import AdapterMeta, adapters, with_connection, with_connection_or_raise
 
 
 class PostgreMeta(AdapterMeta):
     def __call__(cls, *args, **kwargs):
-        if cls != Postgre:
+        if cls not in [Postgre, PostgreNew, PostgreBoolean]:
             return AdapterMeta.__call__(cls, *args, **kwargs)
         available_drivers = [
             driver for driver in cls.drivers
@@ -20,23 +21,22 @@ class PostgreMeta(AdapterMeta):
         else:
             driver = available_drivers[0] if available_drivers else \
                 cls.drivers[0]
-        if driver == 'psycopg2':
-            cls = PostgrePsyco
-        else:
-            cls = PostgrePG8000
+        cls = adapters._registry_[uri_items[0] + ":" + driver]
         return AdapterMeta.__call__(cls, *args, **kwargs)
 
 
 @adapters.register_for('postgres')
-class Postgre(with_metaclass(PostgreMeta, SQLAdapter)):
+class Postgre(
+    with_metaclass(PostgreMeta, ConnectionConfigurationMixin, SQLAdapter)
+):
     dbengine = 'postgres'
     drivers = ('psycopg2', 'pg8000')
     support_distributed_transaction = True
 
     REGEX_URI = re.compile(
         '^(?P<user>[^:@]+)(\:(?P<password>[^@]*))?@(?P<host>\[[^/]+\]|' +
-        '[^\:@]+)(\:(?P<port>[0-9]+))?/(?P<db>[^\?]+)' +
-        '(\?sslmode=(?P<sslmode>.+))?$')
+        '[^\:@]*)(\:(?P<port>[0-9]+))?/(?P<db>[^\?]+)' +
+        '(\?sslmode=(?P<sslmode>.+))?(\?unix_socket=(?P<socket>.+))?$')
 
     def __init__(self, db, uri, pool_size=0, folder=None, db_codec='UTF-8',
                  credential_decoder=IDENTITY, driver_args={},
@@ -60,20 +60,22 @@ class Postgre(with_metaclass(PostgreMeta, SQLAdapter)):
         if not password:
             password = ''
         host = m.group('host')
-        if not host:
+        socket = m.group('socket')
+        if not host and not socket:
             raise SyntaxError('Host name required')
         db = m.group('db')
-        if not db:
+        if not db and not socket:
             raise SyntaxError('Database name required')
-        port = m.group('port') or '5432'
+        port = int(m.group('port') or '5432')
         sslmode = m.group('sslmode')
-        self.driver_args['database'] = db
-        self.driver_args['user'] = user
-        self.driver_args['host'] = host
-        self.driver_args['port'] = int(port)
-        self.driver_args['password'] = password
-        if sslmode:
-            self.driver_args['sslmode'] = sslmode
+        if socket:
+            self.driver_args.update(user=user, host=socket, port=port, password=password)
+            if db:
+                self.driver_args['database'] = db
+        else:
+            self.driver_args.update(database=db, user=user, host=host, port=port, password=password)
+            if sslmode:
+                self.driver_args['sslmode'] = sslmode
         # choose diver according uri
         if self.driver:
             self.__version__ = "%s %s" % (self.driver.__name__,
@@ -81,6 +83,7 @@ class Postgre(with_metaclass(PostgreMeta, SQLAdapter)):
         else:
             self.__version__ = None
         THREAD_LOCAL._pydal_last_insert_ = None
+        self._mock_reconnect()
 
     def _get_json_dialect(self):
         from ..dialects.postgre import PostgreDialectJSON
@@ -104,13 +107,16 @@ class Postgre(with_metaclass(PostgreMeta, SQLAdapter)):
     def after_connection(self):
         self.execute("SET CLIENT_ENCODING TO 'UTF8'")
         self.execute("SET standard_conforming_strings=on;")
+
+    def _configure_on_first_reconnect(self):
         self._config_json()
 
-    def lastrowid(self, table=None):
+    def lastrowid(self, table):
         if self._last_insert:
-            return int(self.cursor.fetchone()[0])
-        self.execute("select lastval()")
-        return int(self.cursor.fetchone()[0])
+            return long(self.cursor.fetchone()[0])
+        sequence_name = table._sequence_name
+        self.execute("SELECT currval(%s);" % self.adapt(sequence_name))
+        return long(self.cursor.fetchone()[0])
 
     def _insert(self, table, fields):
         self._last_insert = None
@@ -118,13 +124,13 @@ class Postgre(with_metaclass(PostgreMeta, SQLAdapter)):
             retval = None
             if hasattr(table, '_id'):
                 self._last_insert = (table._id, 1)
-                retval = table._id.name
+                retval = table._id._rname
             return self.dialect.insert(
-                table.sqlsafe,
-                ','.join(el[0].sqlsafe_name for el in fields),
+                table._rname,
+                ','.join(el[0]._rname for el in fields),
                 ','.join(self.expand(v, f.type) for f, v in fields),
                 retval)
-        return self.dialect.insert_empty(table.sqlsafe)
+        return self.dialect.insert_empty(table._rname)
 
     @with_connection
     def prepare(self, key):
@@ -148,8 +154,8 @@ class PostgrePsyco(Postgre):
             self.connection.server_version >= 90200
         if use_json:
             self.dialect = self._get_json_dialect()(self)
-        if self.driver.__version__ >= '2.5.0':
-            self.parser = self._get_json_parser()(self)
+            if self.driver.__version__ >= '2.5.0':
+                self.parser = self._get_json_parser()(self)
 
     def adapt(self, obj):
         adapted = psycopg2_adapt(obj)
@@ -170,8 +176,8 @@ class PostgrePG8000(Postgre):
     def _config_json(self):
         if self.connection._server_version >= "9.2.0":
             self.dialect = self._get_json_dialect()(self)
-        if self.driver.__version__ >= '1.10.2':
-            self.parser = self._get_json_parser()(self)
+            if self.driver.__version__ >= '1.10.2':
+                self.parser = self._get_json_parser()(self)
 
     def adapt(self, obj):
         return "'%s'" % obj.replace("%", "%%").replace("'", "''")
@@ -196,12 +202,33 @@ class PostgreNew(Postgre):
 
 
 @adapters.register_for('postgres2:psycopg2')
-class PostgrePsycoNew(PostgrePsyco):
+class PostgrePsycoNew(PostgrePsyco, PostgreNew):
     pass
 
 
 @adapters.register_for('postgres2:pg8000')
-class PostgrePG8000New(PostgrePG8000):
+class PostgrePG8000New(PostgrePG8000, PostgreNew):
+    pass
+
+
+@adapters.register_for('postgres3')
+class PostgreBoolean(PostgreNew):
+    def _get_json_dialect(self):
+        from ..dialects.postgre import PostgreDialectBooleanJSON
+        return PostgreDialectBooleanJSON
+
+    def _get_json_parser(self):
+        from ..parsers.postgre import PostgreBooleanAutoJSONParser
+        return PostgreBooleanAutoJSONParser
+
+
+@adapters.register_for('postgres3:psycopg2')
+class PostgrePsycoBoolean(PostgrePsycoNew, PostgreBoolean):
+    pass
+
+
+@adapters.register_for('postgres3:pg8000')
+class PostgrePG8000Boolean(PostgrePG8000New, PostgreBoolean):
     pass
 
 
@@ -241,6 +268,7 @@ class JDBCPostgre(Postgre):
         else:
             self.__version__ = None
         THREAD_LOCAL._pydal_last_insert_ = None
+        self._mock_reconnect()
 
     def connector(self):
         return self.driver.connect(*self.dsn, **self.driver_args)
@@ -249,7 +277,6 @@ class JDBCPostgre(Postgre):
         self.connection.set_client_encoding('UTF8')
         self.execute('BEGIN;')
         self.execute("SET CLIENT_ENCODING TO 'UNICODE';")
-        self._config_json()
 
     def _config_json(self):
         use_json = self.connection.dbversion >= "9.2.0"

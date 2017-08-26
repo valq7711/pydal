@@ -1,14 +1,11 @@
 import re
 import sys
-from .._compat import integer_types
+from .._compat import integer_types, long
 from ..helpers.classes import Reference
 from .base import SQLAdapter
 from . import adapters, with_connection_or_raise
 
-long = integer_types[-1]
-
-
-@adapters.register_for('')
+@adapters.register_for('oracle')
 class Oracle(SQLAdapter):
     dbengine = 'oracle'
     drivers = ('cx_Oracle',)
@@ -40,7 +37,7 @@ class Oracle(SQLAdapter):
         command = self.filter_sql_command(args[0])
         i = 1
         while True:
-            m = self.oracle_fix.match(command)
+            m = self.cmd_fix.match(command)
             if not m:
                 break
             command = command[:m.start('clob')] + str(i) + \
@@ -63,8 +60,8 @@ class Oracle(SQLAdapter):
         return long(self.cursor.fetchone()[0])
 
     def create_sequence_and_triggers(self, query, table, **args):
-        tablename = table._rname or table._tablename
-        id_name = table._id.name
+        tablename = table._rname
+        id_name = table._id._rname
         sequence_name = table._sequence_name
         trigger_name = table._trigger_name
         self.execute(query)
@@ -76,6 +73,10 @@ class Oracle(SQLAdapter):
             sequence_name=sequence_name,
             id=id_name)
         )
+
+    def _select_aux_execute(self, sql):
+        self.execute(sql)
+        return self.fetchall()
 
     def fetchall(self):
         from ..drivers import cx_Oracle
@@ -97,21 +98,21 @@ class Oracle(SQLAdapter):
 
     def _build_value_for_insert(self, field, value, r_values):
         if field.type is 'text':
-            r_values[':' + field.sqlsafe_name] = self.expand(value, field.type)
-            return ':' + field.sqlsafe_name
+            r_values[':' + field._rname] = self.expand(value, field.type)
+            return ':' + field._rname
         return self.expand(value, field.type)
 
     def _insert(self, table, fields):
         if fields:
             r_values = {}
             return self.dialect.insert(
-                table.sqlsafe,
-                ','.join(el[0].sqlsafe_name for el in fields),
+                table._rname,
+                ','.join(el[0]._rname for el in fields),
                 ','.join(
                     self._build_value_for_insert(f, v, r_values)
                     for f, v in fields)
                 ), r_values
-        return self.dialect.insert_empty(table.sqlsafe), None
+        return self.dialect.insert_empty(table._rname), None
 
     def insert(self, table, fields):
         query, values = self._insert(table, fields)

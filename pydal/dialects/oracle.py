@@ -76,9 +76,10 @@ class OracleDialect(SQLDialect):
         return 'DEFAULT %s NOT NULL' % \
             self.adapter.represent(default, field_type)
 
-    def regexp(self, first, second):
+    def regexp(self, first, second, query_env={}):
         return 'REGEXP_LIKE(%s, %s)' % (
-            self.expand(first), self.expand(second, 'string'))
+            self.expand(first, query_env=query_env),
+            self.expand(second, 'string', query_env=query_env))
 
     def select(self, fields, tables, where=None, groupby=None, having=None,
                orderby=None, limitby=None, distinct=False, for_update=False):
@@ -101,8 +102,9 @@ class OracleDialect(SQLDialect):
                 whr2 = whr + " AND w_row > %i" % lmin
             else:
                 whr2 = self.where('w_row > %i' % lmin)
-            return 'SELECT%s %s FROM (SELECT w_tmp.*, ROWNUM w_row FROM ' + \
-                '(SELECT %s FROM %s%s%s%s) w_tmp WHERE ROWNUM<=%i) %s%s%s%s;' \
+
+            return ('SELECT%s %s FROM (SELECT w_tmp.*, ROWNUM w_row FROM '
+                '(SELECT %s FROM %s%s%s%s) w_tmp WHERE ROWNUM<=%i) %s%s%s%s;') \
                 % (
                     dst, fields, fields, tables, whr, grp, order, lmax, tables,
                     whr2, grp, order)
@@ -111,8 +113,8 @@ class OracleDialect(SQLDialect):
         return 'SELECT%s %s FROM %s%s%s%s%s%s%s;' % (
             dst, fields, tables, whr, grp, order, limit, offset, upd)
 
-    def drop(self, table, mode):
+    def drop_table(self, table, mode):
         sequence_name = table._sequence_name
         return [
-            'DROP TABLE %s %s;' % (table.sqlsafe, mode),
+            'DROP TABLE %s %s;' % (table._rname, mode),
             'DROP SEQUENCE %s;' % sequence_name]

@@ -2,18 +2,20 @@ import copy
 import sys
 import types
 from collections import defaultdict
+from contextlib import contextmanager
 from .._compat import PY2, with_metaclass, iterkeys, iteritems, hashlib_md5, \
-    integer_types
+    integer_types, basestring
 from .._globals import IDENTITY
 from ..connection import ConnectionPool
 from ..exceptions import NotOnNOSQLError
 from ..helpers.classes import Reference, ExecutionHandler, SQLCustomType, \
     SQLALL, NullDriver
-from ..helpers.methods import use_common_filters, xorify
-from ..helpers.regex import REGEX_SELECT_AS_PARSER
+from ..helpers.methods import use_common_filters, xorify, merge_tablemaps
+from ..helpers.regex import REGEX_SELECT_AS_PARSER, REGEX_TABLE_DOT_FIELD
 from ..migrator import Migrator
 from ..objects import Table, Field, Expression, Query, Rows, IterRows, \
-    LazySet, LazyReferenceGetter, VirtualCommand
+    LazySet, LazyReferenceGetter, VirtualCommand, Select
+from ..utils import deprecated
 from . import AdapterMeta, with_connection, with_connection_or_raise
 
 
@@ -41,10 +43,10 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
         self.credential_decoder = credential_decoder
         self.driver_args = driver_args
         self.adapter_args = adapter_args
+        self.expand = self._expand
         self._after_connection = after_connection
         self.connection = None
-        if do_connect:
-            self.find_driver()
+        self.find_driver()
         self._initialize_(do_connect)
         if do_connect:
             self.reconnect()
@@ -110,31 +112,33 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
         return rv
 
     def tables(self, *queries):
-        tables = set()
+        tables = dict()
         for query in queries:
             if isinstance(query, Field):
-                tables.add(query.tablename)
+                key = query.tablename
+                if tables.get(key, query.table) is not query.table:
+                    raise ValueError('Name conflict in table list: %s' % key)
+                tables[key] = query.table
             elif isinstance(query, (Expression, Query)):
-                if query.first is not None:
-                    tables = tables.union(self.tables(query.first))
-                if query.second is not None:
-                    tables = tables.union(self.tables(query.second))
-        return list(tables)
+                tmp = [x for x in (query.first, query.second) if x is not None]
+                tables = merge_tablemaps(tables, self.tables(*tmp))
+        return tables
 
     def get_table(self, *queries):
-        tablenames = self.tables(*queries)
-        if len(tablenames) == 1:
-            return tablenames[0]
-        elif len(tablenames) < 1:
+        tablemap = self.tables(*queries)
+        if len(tablemap) == 1:
+            return tablemap.popitem()[1]
+        elif len(tablemap) < 1:
             raise RuntimeError("No table selected")
         else:
             raise RuntimeError(
-                "Too many tables selected (%s)" % str(tablenames))
+                "Too many tables selected (%s)" % str(list(tablemap)))
 
-    def common_filter(self, query, tablenames):
+    def common_filter(self, query, tablist):
         tenant_fieldname = self.db._request_tenant
-        for tablename in tablenames:
-            table = self.db[tablename]
+        for table in tablist:
+            if isinstance(table, basestring):
+                table = self.db[table]
             # deal with user provided filters
             if table._common_filter is not None:
                 query = query & table._common_filter(query)
@@ -149,17 +153,18 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
                         query = query & newquery
         return query
 
-    def expand(self, expression, field_type=None, colnames=False):
+    def _expand(self, expression, field_type=None, colnames=False,
+        query_env={}):
         return str(expression)
 
-    def expand_all(self, fields, tablenames):
+    def expand_all(self, fields, tabledict):
         new_fields = []
         append = new_fields.append
         for item in fields:
             if isinstance(item, SQLALL):
                 new_fields += item._table
             elif isinstance(item, str):
-                m = self.REGEX_TABLE_DOT_FIELD.match(item)
+                m = REGEX_TABLE_DOT_FIELD.match(item)
                 if m:
                     tablename, fieldname = m.groups()
                     append(self.db[tablename][fieldname])
@@ -169,12 +174,12 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
                 append(item)
         # ## if no fields specified take them all from the requested tables
         if not new_fields:
-            for table in tablenames:
-                for field in self.db[table]:
+            for table in tabledict.values():
+                for field in table:
                     append(field)
         return new_fields
 
-    def parse_value(self, value, field_type, blob_decode=True):
+    def parse_value(self, value, field_itype, field_type, blob_decode=True):
         #[Note - gi0baro] I think next if block can be (should be?) avoided
         if field_type != 'blob' and isinstance(value, str):
             try:
@@ -190,7 +195,7 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
         elif field_type == 'blob' and not blob_decode:
             return value
         else:
-            return self.parser.parse(value, field_type)
+            return self.parser.parse(value, field_itype, field_type)
 
     def _add_operators_to_parsed_row(self, rid, table, row):
         for key, record_operator in iteritems(self.db.record_operators):
@@ -198,13 +203,13 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
         if table._db._lazy_tables:
             row['__get_lazy_reference__'] = LazyReferenceGetter(table, rid)
 
-    def _add_reference_sets_to_parsed_row(self, table, tablename, row):
+    def _add_reference_sets_to_parsed_row(self, rid, table, tablename, row):
         for rfield in table._referenced_by:
             referee_link = self.db._referee_name and self.db._referee_name % \
                 dict(table=rfield.tablename, field=rfield.name)
             if referee_link and referee_link not in row and \
                referee_link != tablename:
-                row[referee_link] = LazySet(rfield, id)
+                row[referee_link] = LazySet(rfield, rid)
 
     def _regex_select_as_parser(self, colname):
         return REGEX_SELECT_AS_PARSER.search(colname)
@@ -220,10 +225,10 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
             tablename = None
             #: do we have a real column?
             if tmp:
-                (tablename, fieldname, table, field, ft) = tmp
+                (tablename, fieldname, table, field, ft, fit) = tmp
                 colset = new_row[tablename]
                 #: parse value
-                value = self.parse_value(value, ft, blob_decode)
+                value = self.parse_value(value, fit, ft, blob_decode)
                 if field.filter_out:
                     value = field.filter_out(value)
                 colset[fieldname] = value
@@ -235,10 +240,11 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
                 if ft == 'id' and not cacheable:
                     self._add_operators_to_parsed_row(value, table, colset)
                     self._add_reference_sets_to_parsed_row(
-                        table, tablename, colset)
+                        value, table, tablename, colset)
             #: otherwise we set the value in extras
             else:
-                value = self.parse_value(value, fields[j].type, blob_decode)
+                value = self.parse_value(
+                    value, fields[j]._itype, fields[j].type, blob_decode)
                 extras[colname] = value
                 new_column_name = self._regex_select_as_parser(colname)
                 if new_column_name is not None:
@@ -250,21 +256,19 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
         #: add virtuals
         new_row = self.db.Row(**new_row)
         for tablename in fields_virtual.keys():
-            for f, v in fields_virtual[tablename]:
+            for f, v in fields_virtual[tablename][1]:
                 try:
                     new_row[tablename][f] = v.f(new_row)
                 except (AttributeError, KeyError):
                     pass  # not enough fields to define virtual field
-            for f, v in fields_lazy[tablename]:
+            for f, v in fields_lazy[tablename][1]:
                 try:
-                    new_row[tablename][f] = (v.handler or VirtualCommand)(
-                        v.f, new_row
-                    )
+                    new_row[tablename][f] = v.handler(v.f, new_row)
                 except (AttributeError, KeyError):
                     pass  # not enough fields to define virtual field
         return new_row
 
-    def _parse_expand_colnames(self, colnames):
+    def _parse_expand_colnames(self, fieldlist):
         """
         - Expand a list of colnames into a list of
           (tablename, fieldname, table_obj, field_obj, field_type)
@@ -273,38 +277,38 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
         fields_virtual = {}
         fields_lazy = {}
         tmps = []
-        for colname in colnames:
-            col_m = self.REGEX_TABLE_DOT_FIELD.match(colname)
-            if not col_m:
+        for field in fieldlist:
+            if not isinstance(field, Field):
                 tmps.append(None)
                 continue
-            tablename, fieldname = col_m.groups()
-            table = self.db[tablename]
-            field = table[fieldname]
+            table = field.table
+            tablename, fieldname = table._tablename, field.name
             ft = field.type
-            tmps.append((tablename, fieldname, table, field, ft))
+            fit = field._itype
+            tmps.append((tablename, fieldname, table, field, ft, fit))
             if tablename not in fields_virtual:
-                fields_virtual[tablename] = [
+                fields_virtual[tablename] = (table, [
                     (f.name, f) for f in table._virtual_fields
-                ]
-                fields_lazy[tablename] = [
+                ])
+                fields_lazy[tablename] = (table, [
                     (f.name, f) for f in table._virtual_methods
-                ]
+                ])
         return (fields_virtual, fields_lazy, tmps)
 
     def parse(self, rows, fields, colnames, blob_decode=True, cacheable=False):
         (fields_virtual, fields_lazy, tmps) = \
-            self._parse_expand_colnames(colnames)
+            self._parse_expand_colnames(fields)
         new_rows = [
             self._parse(
                 row, tmps, fields, colnames, blob_decode, cacheable,
                 fields_virtual, fields_lazy)
             for row in rows
         ]
-        rowsobj = Rows(self.db, new_rows, colnames, rawrows=rows)
+        rowsobj = self.db.Rows(self.db, new_rows, colnames, rawrows=rows,
+                fields=fields)
         # Old style virtual fields
-        for tablename in fields_virtual.keys():
-            table = self.db[tablename]
+        for tablename, tmp in fields_virtual.items():
+            table = tmp[0]
             ### old style virtual fields
             for item in table.virtualfields:
                 try:
@@ -330,29 +334,22 @@ class BaseAdapter(with_metaclass(AdapterMeta, ConnectionPool)):
             obj = obj()
         return self.representer.represent(obj, field_type)
 
-    def _drop_cleanup(self, table):
+    def _drop_table_cleanup(self, table):
         del self.db[table._tablename]
         del self.db.tables[self.db.tables.index(table._tablename)]
         self.db._remove_references_to(table)
 
-    def drop(self, table, mode=''):
-        self._drop_cleanup(table)
+    def drop_table(self, table, mode=''):
+        self._drop_table_cleanup(table)
 
     def rowslice(self, rows, minimum=0, maximum=None):
         return rows
 
-    def alias(self, table, alias):
-        other = copy.copy(table)
-        other['_ot'] = other._ot or other.sqlsafe
-        other['ALL'] = SQLALL(other)
-        other['_tablename'] = alias
-        for fieldname in other.fields:
-            other[fieldname] = copy.copy(other[fieldname])
-            other[fieldname]._tablename = alias
-            other[fieldname].tablename = alias
-            other[fieldname].table = other
-        table._db[alias] = other
-        return other
+    def sqlsafe_table(self, tablename, original_tablename=None):
+        return tablename
+
+    def sqlsafe_field(self, fieldname):
+        return fieldname
 
 
 class DebugHandler(ExecutionHandler):
@@ -365,11 +362,12 @@ class SQLAdapter(BaseAdapter):
     #[Note - gi0baro] can_select_for_update should be deprecated and removed
     can_select_for_update = True
     execution_handlers = []
+    migrator_cls = Migrator
 
     def __init__(self, *args, **kwargs):
         super(SQLAdapter, self).__init__(*args, **kwargs)
-        self.migrator = Migrator(self)
-        #if self.db._store_timings_on_execution:
+        migrator_cls = self.adapter_args.get('migrator', self.migrator_cls)
+        self.migrator = migrator_cls(self)
         self.execution_handlers = list(self.db.execution_handlers)
         if self.db._debug:
             self.execution_handlers.insert(0, DebugHandler)
@@ -411,31 +409,27 @@ class SQLAdapter(BaseAdapter):
         handlers = self._build_handlers_for_execution()
         for handler in handlers:
             handler.before_execute(command)
-        #self.db._lastsql = command
         rv = self.cursor.execute(command, *args[1:], **kwargs)
         for handler in handlers:
             handler.after_execute(command)
         return rv
 
-    def expand(self, expression, field_type=None, colnames=False):
+    def _expand(self, expression, field_type=None, colnames=False,
+        query_env={}):
         if isinstance(expression, Field):
-            et = expression.table
             if not colnames:
-                table_rname = et._ot and self.dialect.quote(et._tablename) \
-                    or et._rname or self.dialect.quote(et._tablename)
-                rv = '%s.%s' % (table_rname, expression._rname or
-                                (self.dialect.quote(expression.name)))
+                rv = expression.sqlsafe
             else:
-                rv = '%s.%s' % (self.dialect.quote(et._tablename),
-                                self.dialect.quote(expression.name))
+                rv = expression.longname
             if field_type == 'string' and expression.type not in (
-                    'string', 'text', 'json', 'password'):
-                rv = self.dialect.cast(rv, self.types['text'])
+                    'string', 'text', 'json', 'jsonb', 'password'):
+                rv = self.dialect.cast(rv, self.types['text'], query_env)
         elif isinstance(expression, (Expression, Query)):
             first = expression.first
             second = expression.second
             op = expression.op
             optional_args = expression.optional_args or {}
+            optional_args['query_env'] = query_env
             if second is not None:
                 rv = op(first, second, **optional_args)
             elif first is not None:
@@ -458,16 +452,28 @@ class SQLAdapter(BaseAdapter):
             rv = expression
         return str(rv)
 
+    def _expand_for_index(self, expression, field_type=None, colnames=False,
+        query_env={}):
+        if isinstance(expression, Field):
+            return expression._rname
+        return self._expand(expression, field_type, colnames, query_env)
+
+    @contextmanager
+    def index_expander(self):
+        self.expand = self._expand_for_index
+        yield
+        self.expand = self._expand
+
     def lastrowid(self, table):
         return self.cursor.lastrowid
 
     def _insert(self, table, fields):
         if fields:
             return self.dialect.insert(
-                table.sqlsafe,
-                ','.join(el[0].sqlsafe_name for el in fields),
+                table._rname,
+                ','.join(el[0]._rname for el in fields),
                 ','.join(self.expand(v, f.type) for f, v in fields))
-        return self.dialect.insert_empty(table.sqlsafe)
+        return self.dialect.insert_empty(table._rname)
 
     def insert(self, table, fields):
         query = self._insert(table, fields)
@@ -493,25 +499,25 @@ class SQLAdapter(BaseAdapter):
         (rid._table, rid._record) = (table, None)
         return rid
 
-    def _update(self, tablename, query, fields):
+    def _update(self, table, query, fields):
         sql_q = ''
+        query_env = dict(current_scope=[table._tablename])
         if query:
             if use_common_filters(query):
-                query = self.common_filter(query, [tablename])
-            sql_q = self.expand(query)
+                query = self.common_filter(query, [table])
+            sql_q = self.expand(query, query_env=query_env)
         sql_v = ','.join([
-            '%s=%s' % (field.sqlsafe_name, self.expand(value, field.type))
+            '%s=%s' % (field._rname,
+                self.expand(value, field.type, query_env=query_env))
             for (field, value) in fields])
-        tablename = self.db[tablename].sqlsafe
-        return self.dialect.update(tablename, sql_v, sql_q)
+        return self.dialect.update(table, sql_v, sql_q)
 
-    def update(self, tablename, query, fields):
-        sql = self._update(tablename, query, fields)
+    def update(self, table, query, fields):
+        sql = self._update(table, query, fields)
         try:
             self.execute(sql)
         except:
             e = sys.exc_info()[1]
-            table = self.db[tablename]
             if hasattr(table, '_on_update_error'):
                 return table._on_update_error(table, query, fields, e)
             raise e
@@ -520,42 +526,50 @@ class SQLAdapter(BaseAdapter):
         except:
             return None
 
-    def _delete(self, tablename, query):
+    def _delete(self, table, query):
         sql_q = ''
+        query_env = dict(current_scope=[table._tablename])
         if query:
             if use_common_filters(query):
-                query = self.common_filter(query, [tablename])
-            sql_q = self.expand(query)
-        tablename = self.db[tablename].sqlsafe
-        return self.dialect.delete(tablename, sql_q)
+                query = self.common_filter(query, [table])
+            sql_q = self.expand(query, query_env=query_env)
+        return self.dialect.delete(table, sql_q)
 
-    def delete(self, tablename, query):
-        sql = self._delete(tablename, query)
+    def delete(self, table, query):
+        sql = self._delete(table, query)
         self.execute(sql)
         try:
             return self.cursor.rowcount
         except:
             return None
 
-    def _colexpand(self, field):
-        return self.expand(field, colnames=True)
+    def _colexpand(self, field, query_env):
+        return self.expand(field, colnames=True, query_env=query_env)
 
-    def _geoexpand(self, field):
+    def _geoexpand(self, field, query_env):
         if isinstance(field.type, str) and field.type.startswith('geo') and \
            isinstance(field, Field):
             field = field.st_astext()
-        return self.expand(field)
+        return self.expand(field, query_env=query_env)
 
     def _build_joins_for_select(self, tablenames, param):
         if not isinstance(param, (tuple, list)):
             param = [param]
+        tablemap = {}
+        for item in param:
+            if isinstance(item, Expression):
+                item = item.first
+            key = item._tablename
+            if tablemap.get(key, item) is not item:
+                raise ValueError('Name conflict in table list: %s' % key)
+            tablemap[key] = item
         join_tables = [
             t._tablename for t in param if not isinstance(t, Expression)
         ]
         join_on = [t for t in param if isinstance(t, Expression)]
         tables_to_merge = {}
         for t in join_on:
-            tables_to_merge.update(dict.fromkeys(self.tables(t)))
+            tables_to_merge = merge_tablemaps(tables_to_merge, self.tables(t))
         join_on_tables = [t.first._tablename for t in join_on]
         for t in join_on_tables:
             if t in tables_to_merge:
@@ -567,7 +581,7 @@ class SQLAdapter(BaseAdapter):
         ]
         return (
             join_tables, join_on, tables_to_merge, join_on_tables,
-            important_tablenames, excluded
+            important_tablenames, excluded, tablemap
         )
 
     def _select_wcols(self, query, fields, left=False, join=False,
@@ -575,29 +589,20 @@ class SQLAdapter(BaseAdapter):
                       having=False, limitby=False, orderby_on_limitby=True,
                       for_update=False, outer_scoped=[], required=None,
                       cache=None, cacheable=None, processor=None):
-        #: parse tablenames
-        tablenames = self.tables(query)
-        tablenames_for_common_filters = tablenames
+        #: parse tablemap
+        tablemap = self.tables(query)
         #: apply common filters if needed
         if use_common_filters(query):
-            query = self.common_filter(query, tablenames_for_common_filters)
-        #: expand query if needed
-        if query:
-            query = self.expand(query)
+            query = self.common_filter(query, list(tablemap.values()))
         #: auto-adjust tables
-        for field in fields:
-            for tablename in self.tables(field):
-                if tablename not in tablenames:
-                    tablenames.append(tablename)
-        if len(tablenames) < 1:
-            raise SyntaxError('Set: no tables selected')
+        tablemap = merge_tablemaps(tablemap, self.tables(*fields))
         #: remove outer scoped tables if needed
-        if outer_scoped:
-            tablenames = [
-                name for name in tablenames if name not in outer_scoped]
-        #: prepare columns and expand fields
-        colnames = list(map(self._colexpand, fields))
-        sql_fields = ', '.join(map(self._geoexpand, fields))
+        for item in outer_scoped:
+            # FIXME: check for name conflicts
+            tablemap.pop(item, None)
+        if len(tablemap) < 1:
+            raise SyntaxError('Set: no tables selected')
+        query_tables = list(tablemap)
         #: check for_update argument
         # [Note - gi0baro] I think this should be removed since useless?
         #                  should affect only NoSQL?
@@ -606,55 +611,73 @@ class SQLAdapter(BaseAdapter):
         #: build joins (inner, left outer) and table names
         if join:
             (
+                # FIXME? ijoin_tables is never used
                 ijoin_tables, ijoin_on, itables_to_merge, ijoin_on_tables,
-                iimportant_tablenames, iexcluded
-            ) = self._build_joins_for_select(tablenames, join)
+                iimportant_tablenames, iexcluded, itablemap
+            ) = self._build_joins_for_select(tablemap, join)
+            tablemap = merge_tablemaps(tablemap, itables_to_merge)
+            tablemap = merge_tablemaps(tablemap, itablemap)
         if left:
             (
                 join_tables, join_on, tables_to_merge, join_on_tables,
-                important_tablenames, excluded
-            ) = self._build_joins_for_select(tablenames, left)
+                important_tablenames, excluded, jtablemap
+            ) = self._build_joins_for_select(tablemap, left)
+            tablemap = merge_tablemaps(tablemap, tables_to_merge)
+            tablemap = merge_tablemaps(tablemap, jtablemap)
+        current_scope = outer_scoped + list(tablemap)
+        query_env = dict(current_scope=current_scope,
+            parent_scope=outer_scoped)
+        #: prepare columns and expand fields
+        colnames = [self._colexpand(x, query_env) for x in fields]
+        sql_fields = ', '.join(self._geoexpand(x, query_env) for x in fields)
+        table_alias = lambda name: tablemap[name].query_name(outer_scoped)[0]
         if join and not left:
             cross_joins = iexcluded + list(itables_to_merge)
-            sql_t = '%s' % self.table_alias(cross_joins[0])
-            for t in cross_joins[1:]:
-                sql_t += ' %s' % self.dialect.cross_join(self.table_alias(t))
-            for t in ijoin_on:
-                sql_t += ' %s' % self.dialect.join(t)
+            tokens = [table_alias(cross_joins[0])]
+            tokens += [self.dialect.cross_join(table_alias(t), query_env)
+                    for t in cross_joins[1:]]
+            tokens += [self.dialect.join(t, query_env) for t in ijoin_on]
+            sql_t = ' '.join(tokens)
         elif not join and left:
             cross_joins = excluded + list(tables_to_merge)
-            sql_t = '%s' % self.table_alias(cross_joins[0])
-            for t in cross_joins[1:]:
-                sql_t += ' %s' % self.dialect.cross_join(self.table_alias(t))
+            tokens = [table_alias(cross_joins[0])]
+            tokens += [self.dialect.cross_join(table_alias(t), query_env)
+                    for t in cross_joins[1:]]
+            # FIXME: WTF? This is not correct syntax at least on PostgreSQL
             if join_tables:
-                sql_t += ' %s' % \
-                    self.dialect.left_join(','.join([t for t in join_tables]))
-            for t in join_on:
-                sql_t += ' %s' % self.dialect.left_join(t)
+                tokens.append(self.dialect.left_join(','.join([table_alias(t)
+                        for t in join_tables]), query_env))
+            tokens += [self.dialect.left_join(t, query_env) for t in join_on]
+            sql_t = ' '.join(tokens)
         elif join and left:
             all_tables_in_query = set(
-                important_tablenames + iimportant_tablenames + tablenames)
+                important_tablenames + iimportant_tablenames + query_tables)
             tables_in_joinon = set(join_on_tables + ijoin_on_tables)
             tables_not_in_joinon = \
                 list(all_tables_in_query.difference(tables_in_joinon))
-            sql_t = '%s' % self.table_alias(tables_not_in_joinon[0])
-            for t in tables_not_in_joinon[1:]:
-                sql_t += ' %s' % self.dialect.cross_join(self.table_alias(t))
-            for t in ijoin_on:
-                sql_t += ' %s' % self.dialect.join(t)
+            tokens = [table_alias(tables_not_in_joinon[0])]
+            tokens += [self.dialect.cross_join(table_alias(t), query_env)
+                    for t in tables_not_in_joinon[1:]]
+            tokens += [self.dialect.join(t, query_env) for t in ijoin_on]
+            # FIXME: WTF? This is not correct syntax at least on PostgreSQL
             if join_tables:
-                sql_t += ' %s' % \
-                    self.dialect.left_join(','.join([t for t in join_tables]))
-            for t in join_on:
-                sql_t += ' %s' % self.dialect.left_join(t)
+                tokens.append(self.dialect.left_join(','.join([table_alias(t)
+                        for t in join_tables]), query_env))
+            tokens += [self.dialect.left_join(t, query_env) for t in join_on]
+            sql_t = ' '.join(tokens)
         else:
-            sql_t = ', '.join(self.table_alias(t) for t in tablenames)
+            sql_t = ', '.join(table_alias(t) for t in query_tables)
+        #: expand query if needed
+        if query:
+            query = self.expand(query, query_env=query_env)
+        if having:
+            having = self.expand(having, query_env=query_env)
         #: groupby
         sql_grp = groupby
         if groupby:
             if isinstance(groupby, (list, tuple)):
                 groupby = xorify(groupby)
-            sql_grp = self.expand(groupby)
+            sql_grp = self.expand(groupby, query_env=query_env)
         #: orderby
         sql_ord = False
         if orderby:
@@ -663,15 +686,15 @@ class SQLAdapter(BaseAdapter):
             if str(orderby) == '<random>':
                 sql_ord = self.dialect.random
             else:
-                sql_ord = self.expand(orderby)
+                sql_ord = self.expand(orderby, query_env=query_env)
         #: set default orderby if missing
-        if (limitby and not groupby and tablenames and orderby_on_limitby and
+        if (limitby and not groupby and query_tables and orderby_on_limitby and
            not orderby):
             sql_ord = ', '.join([
-                self.db[t].sqlsafe + '.' + self.db[t][x].sqlsafe_name
-                for t in tablenames
-                for x in (hasattr(self.db[t], '_primarykey') and
-                          self.db[t]._primarykey or ['_id'])
+                tablemap[t][x].sqlsafe
+                for t in query_tables if not isinstance(tablemap[t], Select)
+                for x in (hasattr(tablemap[t], '_primarykey') and
+                          tablemap[t]._primarykey or ['_id'])
             ])
         #: build sql using dialect
         return colnames, self.dialect.select(
@@ -681,6 +704,9 @@ class SQLAdapter(BaseAdapter):
 
     def _select(self, query, fields, attributes):
         return self._select_wcols(query, fields, **attributes)[1]
+
+    def nested_select(self, query, fields, attributes):
+        return Select(self.db, query, fields, attributes)
 
     def _select_aux_execute(self, sql):
         self.execute(sql)
@@ -720,10 +746,12 @@ class SQLAdapter(BaseAdapter):
         key = self.uri + '/' + sql
         key = hashlib_md5(key).hexdigest()
         args = (sql, fields, attributes, colnames)
-        return cache_model(
+        ret = cache_model(
             key,
             lambda self=self, args=args: self._select_aux(*args),
             time_expire)
+        ret._restore_fields(fields)
+        return ret
 
     def select(self, query, fields, attributes):
         colnames, sql = self._select_wcols(query, fields, **attributes)
@@ -739,18 +767,21 @@ class SQLAdapter(BaseAdapter):
         return self.iterparse(sql, fields, colnames, cacheable=cacheable)
 
     def _count(self, query, distinct=None):
-        tablenames = self.tables(query)
+        tablemap = self.tables(query)
+        tablenames = list(tablemap)
+        tables = list(tablemap.values())
+        query_env = dict(current_scope=tablenames)
         sql_q = ''
         if query:
             if use_common_filters(query):
-                query = self.common_filter(query, tablenames)
-            sql_q = self.expand(query)
-        sql_t = ','.join(self.table_alias(t) for t in tablenames)
+                query = self.common_filter(query, tables)
+            sql_q = self.expand(query, query_env=query_env)
+        sql_t = ','.join(self.table_alias(t, []) for t in tables)
         sql_fields = '*'
         if distinct:
             if isinstance(distinct, (list, tuple)):
                 distinct = xorify(distinct)
-            sql_fields = self.expand(distinct)
+            sql_fields = self.expand(distinct, query_env=query_env)
         return self.dialect.select(
             self.dialect.count(sql_fields, distinct), sql_t, sql_q
         )
@@ -765,20 +796,24 @@ class SQLAdapter(BaseAdapter):
     def create_table(self, *args, **kwargs):
         return self.migrator.create_table(*args, **kwargs)
 
-    def _drop_cleanup(self, table):
-        super(SQLAdapter, self)._drop_cleanup(table)
+    def _drop_table_cleanup(self, table):
+        super(SQLAdapter, self)._drop_table_cleanup(table)
         if table._dbt:
             self.migrator.file_delete(table._dbt)
             self.migrator.log('success!\n', table)
 
-    def drop(self, table, mode=''):
-        queries = self.dialect.drop(table, mode)
+    def drop_table(self, table, mode=''):
+        queries = self.dialect.drop_table(table, mode)
         for query in queries:
             if table._dbt:
                 self.migrator.log(query + '\n', table)
             self.execute(query)
         self.commit()
-        self._drop_cleanup(table)
+        self._drop_table_cleanup(table)
+
+    @deprecated('drop', 'drop_table', 'SQLAdapter')
+    def drop(self, table, mode=''):
+        return self.drop_table(table, mode='')
 
     def truncate(self, table, mode=''):
         # Prepare functions "write_to_logfile" and "close_logfile"
@@ -790,6 +825,33 @@ class SQLAdapter(BaseAdapter):
             self.migrator.log('success!\n', table)
         finally:
             pass
+
+    def create_index(self, table, index_name, *fields, **kwargs):
+        expressions = [
+            field._rname if isinstance(field, Field) else field
+            for field in fields]
+        sql = self.dialect.create_index(
+            index_name, table, expressions, **kwargs)
+        try:
+            self.execute(sql)
+            self.commit()
+        except Exception as e:
+            self.rollback()
+            err = 'Error creating index %s\n  Driver error: %s\n' + \
+                '  SQL instruction: %s'
+            raise RuntimeError(err % (index_name, str(e), sql))
+        return True
+
+    def drop_index(self, table, index_name):
+        sql = self.dialect.drop_index(index_name, table)
+        try:
+            self.execute(sql)
+            self.commit()
+        except Exception as e:
+            self.rollback()
+            err = 'Error dropping index %s\n  Driver error: %s'
+            raise RuntimeError(err % (index_name, str(e)))
+        return True
 
     def distributed_transaction_begin(self, key):
         pass
@@ -825,10 +887,10 @@ class SQLAdapter(BaseAdapter):
     def sqlsafe_field(self, fieldname):
         return self.dialect.quote(fieldname)
 
-    def table_alias(self, tbl):
-        if not isinstance(tbl, Table):
+    def table_alias(self, tbl, current_scope=[]):
+        if isinstance(tbl, basestring):
             tbl = self.db[tbl]
-        return tbl.sqlsafe_alias
+        return tbl.query_name(current_scope)[0]
 
     def id_query(self, table):
         pkeys = getattr(table, '_primarykey', None)
@@ -871,20 +933,22 @@ class NoSQLAdapter(BaseAdapter):
                 # this is unnecessary if the fields are indexed and unique
                 table._uniques.append(field_name)
 
-    def drop(self, table, mode=''):
+    def drop_table(self, table, mode=''):
         ctable = self.connection[table._tablename]
         ctable.drop()
-        self._drop_cleanup(table)
+        self._drop_table_cleanup(table)
+
+    @deprecated('drop', 'drop_table', 'SQLAdapter')
+    def drop(self, table, mode=''):
+        return self.drop_table(table, mode='')
 
     def _select(self, *args, **kwargs):
         raise NotOnNOSQLError(
             "Nested queries are not supported on NoSQL databases")
 
-    def sqlsafe_table(self, tablename, original_tablename=None):
-        return tablename
-
-    def sqlsafe_field(self, fieldname):
-        return fieldname
+    def nested_select(self, *args, **kwargs):
+        raise NotOnNOSQLError(
+            "Nested queries are not supported on NoSQL databases")
 
 
 class NullAdapter(BaseAdapter):

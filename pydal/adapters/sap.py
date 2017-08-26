@@ -1,10 +1,7 @@
 import re
-from .._compat import integer_types
+from .._compat import integer_types, long
 from .base import SQLAdapter
 from . import adapters
-
-long = integer_types[-1]
-
 
 @adapters.register_for('sapdb')
 class SAPDB(SQLAdapter):
@@ -48,5 +45,5 @@ class SAPDB(SQLAdapter):
         self.execute('CREATE SEQUENCE %s;' % table._sequence_name)
         self.execute(
             "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT NEXTVAL('%s');" %
-            (table._tablename, table._id.name, table._sequence_name))
+            (table._rname, table._id._rname, table._sequence_name))
         self.execute(query)

@@ -1,9 +1,10 @@
 import copy
 import random
 from datetime import datetime
-from .._compat import integer_types, basestring
+from .._compat import basestring, long
 from ..exceptions import NotOnNOSQLError
-from ..helpers.classes import FakeCursor, Reference, SQLALL
+from ..helpers.classes import (
+    FakeCursor, Reference, SQLALL, ConnectionConfigurationMixin)
 from ..helpers.methods import use_common_filters, xorify
 from ..objects import Field, Row, Query, Expression
 from .base import NoSQLAdapter
@@ -17,11 +18,9 @@ except:
         pass
     USER_DEFINED_SUBTYPE = 0
 
-long = integer_types[-1]
-
 
 @adapters.register_for('mongodb')
-class Mongo(NoSQLAdapter):
+class Mongo(ConnectionConfigurationMixin, NoSQLAdapter):
     dbengine = 'mongodb'
     drivers = ('pymongo',)
 
@@ -65,6 +64,7 @@ class Mongo(NoSQLAdapter):
         # synchronous, except when overruled by either this default or
         # function parameter
         self.safe = 1 if self.adapter_args.get('safe', True) else 0
+        self._mock_reconnect()
 
     def connector(self):
         conn = self.driver.MongoClient(self.uri, w=self.safe)[self._driver_db]
@@ -73,7 +73,7 @@ class Mongo(NoSQLAdapter):
         conn.commit = lambda: None
         return conn
 
-    def after_connection(self):
+    def _configure_on_first_reconnect(self):
         #: server version
         self._server_version = self.connection.command(
             "serverStatus")['version']
@@ -151,7 +151,7 @@ class Mongo(NoSQLAdapter):
         except (AttributeError, TypeError):
             return None
 
-    def expand(self, expression, field_type=None):
+    def _expand(self, expression, field_type=None, query_env={}):
         if isinstance(expression, Field):
             if expression.type == 'id':
                 result = "_id"
@@ -172,6 +172,7 @@ class Mongo(NoSQLAdapter):
                     second = self.object_id(expression.second)
             op = expression.op
             optional_args = expression.optional_args or {}
+            optional_args['query_env'] = query_env
             if second is not None:
                 result = op(first, second, **optional_args)
             elif first is not None:
@@ -181,10 +182,10 @@ class Mongo(NoSQLAdapter):
             else:
                 result = op(**optional_args)
         elif isinstance(expression, Expansion):
-            expression.query = (self.expand(expression.query, field_type))
+            expression.query = (self.expand(expression.query, field_type,
+                query_env=query_env))
             result = expression
         elif isinstance(expression, (list, tuple)):
-            raise NotImplementedError("How did you reach this line of code???")
             result = [self.represent(item, field_type) for item in expression]
         elif field_type:
             result = self.represent(expression, field_type)
@@ -243,17 +244,17 @@ class Mongo(NoSQLAdapter):
             else:
                 new_fields.append(item)
         fields = new_fields
-        tablename = self.get_table(query, *fields)
+        tablename = self.get_table(query, *fields)._tablename
 
         if for_update:
             self.db.logger.warning(
-                "Attribute 'for_update' unsuppored by MongoDB")
+                "Attribute 'for_update' unsupported by MongoDB")
         if join or left:
             raise NotOnNOSQLError("Joins not supported on NoSQL databases")
         if required or cache or cacheable:
             self.db.logger.warning(
                 "Attributes 'required', 'cache' and 'cacheable' are" +
-                " unsuppored by MongoDB")
+                " unsupported by MongoDB")
 
         if limitby and orderby_on_limitby and not orderby:
             if groupby:
@@ -328,7 +329,7 @@ class Mongo(NoSQLAdapter):
                     # Mongodb reserved uuid key
                     colname = (tablename + '.' + 'id', '_id')
                 else:
-                    colname = (tablename + '.' + field.name, field.name)
+                    colname = (field.longname, field.name)
             elif not isinstance(query, Expression):
                 colname = (field.name, field.name)
             colnames.append(colname[1])
@@ -430,7 +431,7 @@ class Mongo(NoSQLAdapter):
         else:
             return None
 
-    def update(self, tablename, query, fields, safe=None):
+    def update(self, table, query, fields, safe=None):
         # return amount of adjusted rows or zero, but no exceptions
         # @ related not finding the result
         if not isinstance(query, Query):
@@ -469,7 +470,7 @@ class Mongo(NoSQLAdapter):
             raise RuntimeError(
                 "uncaught exception when updating rows: %s" % e)
 
-    def delete(self, tablename, query, safe=None):
+    def delete(self, table, query, safe=None):
         if not isinstance(query, Query):
             raise RuntimeError("query type %s is not supported" % type(query))
 
@@ -483,11 +484,10 @@ class Mongo(NoSQLAdapter):
 
         # find references to deleted items
         db = self.db
-        table = db[tablename]
         cascade = []
         set_null = []
         for field in table._referenced_by:
-            if field.type == 'reference ' + tablename:
+            if field.type == 'reference ' + table._tablename:
                 if field.ondelete == 'CASCADE':
                     cascade.append(field)
                 if field.ondelete == 'SET NULL':
@@ -495,7 +495,7 @@ class Mongo(NoSQLAdapter):
         cascade_list = []
         set_null_list = []
         for field in table._referenced_by_list:
-            if field.type == 'list:reference ' + tablename:
+            if field.type == 'list:reference ' + table._tablename:
                 if field.ondelete == 'CASCADE':
                     cascade_list.append(field)
                 if field.ondelete == 'SET NULL':
@@ -610,7 +610,8 @@ class Expansion(object):
             self.fields = [self.annotate_expression(f)
                            for f in (fields or [])]
 
-        self.tablename = tablename or adapter.get_table(query, *self.fields)
+        self.tablename = (tablename or
+                adapter.get_table(query, *self.fields)._tablename)
         if use_common_filters(query):
             query = adapter.common_filter(query, [self.tablename])
         self.query = self.annotate_expression(query)
